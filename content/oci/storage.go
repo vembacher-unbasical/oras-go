@@ -23,6 +23,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -129,15 +131,51 @@ func (s *Storage) ingest(expected ocispec.Descriptor, content io.Reader) (path s
 	if err := ensureDir(s.ingestRoot); err != nil {
 		return "", fmt.Errorf("failed to ensure ingest dir: %w", err)
 	}
+	var fp *os.File
+	// use reflection magic to pick up partially downloaded ingest files
+	if reflect.TypeOf(content).Implements(reflect.TypeOf((*io.ReadSeeker)(nil)).Elem()) {
+		entries, err := os.ReadDir(s.ingestRoot)
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), expected.Digest.Encoded()) {
+				fp, err = os.OpenFile(filepath.Join(s.ingestRoot, entry.Name()), os.O_RDWR, 0600)
+				if err != nil {
+					return "", fmt.Errorf("failed to open file %s for download continuation: %w", entry.Name(), err)
+				}
+				fstat, err := fp.Stat()
+				if err != nil {
+					panic(err)
+				}
+				size := fstat.Size()
+
+				// make sure file and reader point to the same offset
+				_, err = fp.Seek(size, io.SeekStart)
+				if err != nil {
+					panic(err)
+				}
+				_, err = content.(io.Seeker).Seek(0, io.SeekStart)
+				if err != nil {
+					panic(err)
+				}
+				println("successfully called seek on file and reader")
+				// break is necessary in case there are multiple ingest files for the same blob
+				break
+			}
+		}
+
+	}
+	if fp == nil {
+		// assigning directly seems to shadow fp
+		fp_, err := os.CreateTemp(s.ingestRoot, expected.Digest.Encoded()+"_*")
+		if err != nil {
+			return "", fmt.Errorf("failed to create ingest file: %w", err)
+		}
+		fp = fp_
+	}
 
 	// create a temp file with the file name format "blobDigest_randomString"
 	// in the ingest directory.
 	// Go ensures that multiple programs or goroutines calling CreateTemp
 	// simultaneously will not choose the same file.
-	fp, err := os.CreateTemp(s.ingestRoot, expected.Digest.Encoded()+"_*")
-	if err != nil {
-		return "", fmt.Errorf("failed to create ingest file: %w", err)
-	}
 
 	path = fp.Name()
 	defer func() {
