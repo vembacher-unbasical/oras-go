@@ -1,19 +1,4 @@
-/*
-Copyright The ORAS Authors.
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
-package oci
+package oci_file
 
 import (
 	"context"
@@ -21,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"oras.land/oras-go/v2/content/file"
+	"oras.land/oras-go/v2/internal/contentstoreutil"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -47,34 +34,47 @@ var bufPool = sync.Pool{
 // Storage is a CAS based on file system with the OCI-Image layout.
 // Reference: https://github.com/opencontainers/image-spec/blob/v1.1.0/image-layout.md
 type Storage struct {
-	*ReadOnlyStorage
-	// root is the root directory of the OCI layout.
-	root string
-	// ingestRoot is the root directory of the temporary ingest files.
+	*contentstoreutil.ReadOnlyStorage
+	// cacheRoot is the cacheRoot directory of the OCI layout.
+	cacheRoot string
+	// ingestRoot is the cacheRoot directory of the temporary ingest files.
 	ingestRoot string
+	// fsRoot
+	fsRoot                    string
+	DisableOverwrite          bool
+	AllowPathTraversalOnWrite bool
 }
 
 // NewStorage creates a new CAS based on file system with the OCI-Image layout.
-func NewStorage(root string) (*Storage, error) {
+func NewStorage(root, fsRoot string) (*Storage, error) {
 	rootAbs, err := filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve absolute path for %s: %w", root, err)
 	}
+	fsRootAbs, err := filepath.Abs(fsRoot)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve absolute path for %s: %w", fsRoot, err)
+	}
+	err = ensureDir(fsRootAbs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create directories for %s: %w", fsRootAbs, err)
+	}
 
 	return &Storage{
-		ReadOnlyStorage: NewStorageFromFS(os.DirFS(rootAbs)),
-		root:            rootAbs,
+		ReadOnlyStorage: contentstoreutil.NewStorageFromFS(os.DirFS(rootAbs)),
+		cacheRoot:       rootAbs,
+		fsRoot:          fsRootAbs,
 		ingestRoot:      filepath.Join(rootAbs, "ingest"),
 	}, nil
 }
 
 // Push pushes the content, matching the expected descriptor.
 func (s *Storage) Push(_ context.Context, expected ocispec.Descriptor, content io.Reader) error {
-	path, err := blobPath(expected.Digest)
+	path, err := contentstoreutil.BlobPath(expected.Digest)
 	if err != nil {
 		return fmt.Errorf("%s: %s: %w", expected.Digest, expected.MediaType, errdef.ErrInvalidDigest)
 	}
-	target := filepath.Join(s.root, path)
+	target := filepath.Join(s.cacheRoot, path)
 
 	// check if the target content already exists in the blob directory.
 	if _, err := os.Stat(target); err == nil {
@@ -106,16 +106,23 @@ func (s *Storage) Push(_ context.Context, expected ocispec.Descriptor, content i
 		return err
 	}
 
+	if name := expected.Annotations[ocispec.AnnotationTitle]; name != "" {
+		linkTarget, err := s.resolveWritePath(name)
+		err = os.Symlink(target, linkTarget)
+		if err != nil {
+			panic(err)
+		}
+	}
 	return nil
 }
 
 // Delete removes the target from the system.
 func (s *Storage) Delete(ctx context.Context, target ocispec.Descriptor) error {
-	path, err := blobPath(target.Digest)
+	path, err := contentstoreutil.BlobPath(target.Digest)
 	if err != nil {
 		return fmt.Errorf("%s: %s: %w", target.Digest, target.MediaType, errdef.ErrInvalidDigest)
 	}
-	targetPath := filepath.Join(s.root, path)
+	targetPath := filepath.Join(s.cacheRoot, path)
 	err = os.Remove(targetPath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -124,6 +131,25 @@ func (s *Storage) Delete(ctx context.Context, target ocispec.Descriptor) error {
 		return err
 	}
 	return nil
+}
+
+func (s *Storage) Exists(ctx context.Context, target ocispec.Descriptor) (bool, error) {
+	exists, err := s.ReadOnlyStorage.Exists(ctx, target)
+	if !exists {
+		return false, err
+	}
+	if name := target.Annotations[ocispec.AnnotationTitle]; name != "" {
+		path, err := s.resolveWritePath(name)
+		if err != nil {
+			return false, err
+		}
+		_, err = os.Stat(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return true, err
+	}
+	return true, err
 }
 
 // ingest write the content into a temporary ingest file.
@@ -223,7 +249,46 @@ func (s *Storage) ingest(expected ocispec.Descriptor, content io.Reader) (path s
 	return
 }
 
+// resolveWritePath resolves the path to write for the given name.
+func (s *Storage) resolveWritePath(name string) (string, error) {
+	path := s.absPath(name)
+	if !s.AllowPathTraversalOnWrite {
+		base, err := filepath.Abs(s.fsRoot)
+		if err != nil {
+			return "", err
+		}
+		target, err := filepath.Abs(path)
+		if err != nil {
+			return "", err
+		}
+		rel, err := filepath.Rel(base, target)
+		if err != nil {
+			return "", file.ErrPathTraversalDisallowed
+		}
+		rel = filepath.ToSlash(rel)
+		if strings.HasPrefix(rel, "../") || rel == ".." {
+			return "", file.ErrPathTraversalDisallowed
+		}
+	}
+	if s.DisableOverwrite {
+		if _, err := os.Stat(path); err == nil {
+			return "", file.ErrOverwriteDisallowed
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+	}
+	return path, nil
+}
+
 // ensureDir ensures the directories of the path exists.
 func ensureDir(path string) error {
 	return os.MkdirAll(path, 0777)
+}
+
+// absPath returns the absolute path of the path.
+func (s *Storage) absPath(path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(s.fsRoot, path)
 }

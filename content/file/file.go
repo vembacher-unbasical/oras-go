@@ -453,10 +453,14 @@ func (s *Store) saveFile(fp *os.File, expected ocispec.Descriptor, content io.Re
 		}
 	}()
 	path := fp.Name()
-
+	stat, err := fp.Stat()
+	if err != nil {
+		panic(err)
+	}
+	r := ioutil.NewSkipWriter(fp, int(stat.Size()))
 	buf := bufPool.Get().(*[]byte)
 	defer bufPool.Put(buf)
-	if err := ioutil.CopyBuffer(fp, content, *buf, expected); err != nil {
+	if err := ioutil.CopyBuffer(&r, content, *buf, expected); err != nil {
 		return fmt.Errorf("failed to copy content to %s: %w", path, err)
 	}
 
@@ -469,12 +473,53 @@ func (s *Store) pushFile(target string, expected ocispec.Descriptor, content io.
 	if err := ensureDir(filepath.Dir(target)); err != nil {
 		return fmt.Errorf("failed to ensure directories of the target path: %w", err)
 	}
+	var fp *os.File
+	var content_ io.Reader
+	// Check if reader supports seeking and if we have an existing file
+	cReadSeeker, ok := content.(io.ReadSeeker)
+	_, err := os.Stat(target)
+	if ok && !os.IsNotExist(err) {
+		// open file for writing and set position to the end
+		fpW, err := os.OpenFile(target, os.O_RDWR, 0600)
+		if err != nil {
+			return fmt.Errorf("failed to create or open file %s: %w", target, err)
+		}
+		fStats, err := fpW.Stat()
+		if err != nil {
+			panic(err)
+		}
+		size := fStats.Size()
+		// also update content reader to the same position
+		_, err = cReadSeeker.Seek(size, io.SeekStart)
+		if err != nil {
+			panic(err)
+		}
+		_, err = fpW.Seek(size, io.SeekStart)
+		if err != nil {
+			panic(err)
+		}
+		// open same file for reading
+		fpR, err := os.OpenFile(target, os.O_RDWR, 0600)
+		if err != nil {
+			return fmt.Errorf("failed to create or open file %s: %w", target, err)
+		}
+		// create reader that reads already downloaded file and then fetches the rest
+		content_ = io.MultiReader(io.LimitReader(fpR, size), content)
+		// set fp to the writing file
+		fp = fpW
 
-	fp, err := os.Create(target)
-	if err != nil {
-		return fmt.Errorf("failed to create file %s: %w", target, err)
 	}
+	if fp == nil {
+		fp_, err := os.Create(target)
+		if err != nil {
+			return fmt.Errorf("failed to create file %s: %w", target, err)
+		}
+		fp = fp_
 
+	}
+	if content_ != nil {
+		content = content_
+	}
 	return s.saveFile(fp, expected, content)
 }
 
