@@ -135,7 +135,7 @@ func (s *CachedStore) Push(ctx context.Context, expected ocispec.Descriptor, rea
 func (s *CachedStore) Exists(ctx context.Context, target ocispec.Descriptor) (bool, error) {
 	s.sync.RLock()
 	defer s.sync.RUnlock()
-
+	fmt.Printf("checking if %s exists \n", target.Digest)
 	return s.storage.Exists(ctx, target)
 }
 

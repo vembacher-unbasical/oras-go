@@ -168,6 +168,7 @@ func (s *Storage) Exists(ctx context.Context, target ocispec.Descriptor) (bool, 
 		if errors.Is(err, fs.ErrNotExist) {
 			return false, nil
 		}
+		fmt.Printf("%s exists\n", target.Digest)
 		return true, err
 	}
 	return true, err
@@ -178,8 +179,9 @@ func (s *Storage) ingest(expected ocispec.Descriptor, content io.Reader) (path s
 	if err := ensureDir(s.ingestRoot); err != nil {
 		return "", fmt.Errorf("failed to ensure ingest dir: %w", err)
 	}
-	var writer io.Writer
+	var writer *ioutil.SkipWriter
 	// use reflection magic to pick up partially downloaded ingest files
+	// todo refactor this to use nicer pattern
 	if reflect.TypeOf(content).Implements(reflect.TypeOf((*io.ReadSeeker)(nil)).Elem()) {
 		entries, err := os.ReadDir(s.ingestRoot)
 		if err != nil {
@@ -226,6 +228,7 @@ func (s *Storage) ingest(expected ocispec.Descriptor, content io.Reader) (path s
 				w := ioutil.NewSkipWriter(fpW, int(size))
 				writer = &w
 				// break is necessary in case there are multiple ingest files for the same blob
+				fmt.Printf("continuing from %d/%d bytes\n", size, expected.Size)
 				break
 			}
 		}
@@ -248,7 +251,8 @@ func (s *Storage) ingest(expected ocispec.Descriptor, content io.Reader) (path s
 				os.Remove(path)
 			}
 		}()
-		writer = fp
+		w := ioutil.NewSkipWriter(fp, 0)
+		writer = &w
 	}
 
 	// create a temp file with the file name format "blobDigest_randomString"
@@ -259,8 +263,10 @@ func (s *Storage) ingest(expected ocispec.Descriptor, content io.Reader) (path s
 	buf := bufPool.Get().(*[]byte)
 	defer bufPool.Put(buf)
 	if err := ioutil.CopyBuffer(writer, content, *buf, expected); err != nil {
+		fmt.Printf("fetching failed after reading %d new bytes out of %d in total\n", writer.BytesWritten(), expected.Size)
 		return "", fmt.Errorf("failed to ingest: %w", err)
 	}
+	fmt.Printf("successfully fetched %d new bytes out of %d\n", writer.BytesWritten(), expected.Size)
 
 	// change to readonly
 	if err := os.Chmod(path, 0444); err != nil {

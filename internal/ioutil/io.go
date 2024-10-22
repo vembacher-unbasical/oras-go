@@ -66,16 +66,20 @@ func UnwrapNopCloser(r io.Reader) io.Reader {
 }
 
 type SkipWriter struct {
-	w         io.Writer
-	skipBytes int
+	w              io.Writer
+	skipBytes      int
+	bytesProcessed int
 }
 
 func (s *SkipWriter) Write(p []byte) (n int, err error) {
 	if s.skipBytes == 0 {
-		return s.w.Write(p)
+		n, err = s.w.Write(p)
+		s.bytesProcessed += n
+		return n, err
 	}
 	if s.skipBytes < len(p) {
 		n, err = s.w.Write(p[s.skipBytes:])
+		s.bytesProcessed += n
 		n += s.skipBytes
 		s.skipBytes = 0
 		return
@@ -86,5 +90,9 @@ func (s *SkipWriter) Write(p []byte) (n int, err error) {
 }
 
 func NewSkipWriter(w io.Writer, skipBytes int) SkipWriter {
-	return SkipWriter{w, skipBytes}
+	return SkipWriter{w, skipBytes, 0}
+}
+
+func (s *SkipWriter) BytesWritten() int {
+	return max(0, s.bytesProcessed-s.skipBytes)
 }
