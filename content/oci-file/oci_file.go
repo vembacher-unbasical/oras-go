@@ -65,17 +65,17 @@ type CachedStore struct {
 }
 
 // New creates a new OCI store with context.Background().
-func New(root, fsRoot string) (*CachedStore, error) {
-	return NewWithContext(context.Background(), root, fsRoot)
+func New(root, fsRoot string, symlinkFromCache bool) (*CachedStore, error) {
+	return NewWithContext(context.Background(), root, fsRoot, symlinkFromCache)
 }
 
 // NewWithContext creates a new OCI store.
-func NewWithContext(ctx context.Context, root, fsRoot string) (*CachedStore, error) {
+func NewWithContext(ctx context.Context, root, fsRoot string, symlinkFromCache bool) (*CachedStore, error) {
 	rootAbs, err := filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve absolute path for %s: %w", root, err)
 	}
-	storage, err := NewStorage(rootAbs, fsRoot)
+	storage, err := NewStorage(rootAbs, fsRoot, symlinkFromCache)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create storage: %w", err)
 	}

@@ -43,10 +43,11 @@ type Storage struct {
 	fsRoot                    string
 	DisableOverwrite          bool
 	AllowPathTraversalOnWrite bool
+	SymlinkFromCache          bool
 }
 
 // NewStorage creates a new CAS based on file system with the OCI-Image layout.
-func NewStorage(root, fsRoot string) (*Storage, error) {
+func NewStorage(root, fsRoot string, symlinkFromCache bool) (*Storage, error) {
 	rootAbs, err := filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve absolute path for %s: %w", root, err)
@@ -61,10 +62,11 @@ func NewStorage(root, fsRoot string) (*Storage, error) {
 	}
 
 	return &Storage{
-		ReadOnlyStorage: contentstoreutil.NewStorageFromFS(os.DirFS(rootAbs)),
-		cacheRoot:       rootAbs,
-		fsRoot:          fsRootAbs,
-		ingestRoot:      filepath.Join(rootAbs, "ingest"),
+		ReadOnlyStorage:  contentstoreutil.NewStorageFromFS(os.DirFS(rootAbs)),
+		cacheRoot:        rootAbs,
+		fsRoot:           fsRootAbs,
+		ingestRoot:       filepath.Join(rootAbs, "ingest"),
+		SymlinkFromCache: symlinkFromCache,
 	}, nil
 }
 
@@ -107,10 +109,29 @@ func (s *Storage) Push(_ context.Context, expected ocispec.Descriptor, content i
 	}
 
 	if name := expected.Annotations[ocispec.AnnotationTitle]; name != "" {
-		linkTarget, err := s.resolveWritePath(name)
-		err = os.Symlink(target, linkTarget)
+		outputPath, err := s.resolveWritePath(name)
 		if err != nil {
 			panic(err)
+		}
+
+		if !s.SymlinkFromCache {
+			// move file to output dir
+			// update permissions
+			// create symlink to cache
+			if err := os.Rename(target, outputPath); err != nil {
+				panic(err)
+			}
+			if err := os.Chmod(outputPath, os.FileMode(0600)); err != nil {
+				panic(err)
+			}
+			if err := os.Symlink(outputPath, target); err != nil {
+				panic(err)
+			}
+		} else {
+			err = os.Symlink(target, outputPath)
+			if err != nil {
+				panic(err)
+			}
 		}
 	}
 	return nil
